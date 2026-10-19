@@ -131,7 +131,7 @@ fn test_has_record_true_after_set() {
 }
 
 #[test]
-#[should_panic(expected = "record not found")]
+#[should_panic(expected = "Error(Contract, #301)")]
 fn test_get_record_panics_when_missing() {
     let e = Env::default();
     e.mock_all_auths();
@@ -176,7 +176,7 @@ fn test_remove_nonexistent_record_is_noop() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[should_panic(expected = "not initialized")]
+#[should_panic(expected = "Error(Contract, #1)")]
 fn test_get_admin_panics_before_init() {
     let e = Env::default();
     e.mock_all_auths();
@@ -270,9 +270,10 @@ fn test_expiry_pattern() {
     advance_time(&e, 100);
 
     assert!(client.is_expired(&owner));
-    assert!(!client.has_record(&owner)); // has_record should purge and return false
+    assert!(!client.has_record(&owner));
 
-    // Now it's truly gone
+    // Explicitly purge the expired record from storage
+    client.purge_expired(&owner);
     assert!(!client.is_expired(&owner));
 }
 
@@ -375,27 +376,18 @@ fn test_set_record_already_expired_at_write_time() {
     let (_, _, client) = setup(&e);
 
     let owner = Address::generate(&e);
-    let now = e.ledger().timestamp();
-    // expires_at in the past relative to current ledger time
-    if now > 0 {
-        client.set_record(&owner, &3, &(now - 1));
-    } else {
-        // timestamp starts at 0 in default env; advance then set past expiry
-        advance_time(&e, 50);
-        let t = e.ledger().timestamp();
-        client.set_record(&owner, &3, &(t - 1));
-    }
-
-    assert!(client.is_expired(&owner));
-    assert!(!client.has_record(&owner)); // purge on has_record
-        }
+    advance_time(&e, 50);
+    let t = e.ledger().timestamp();
+    assert!(client.try_set_record(&owner, &3, &(t - 1)).is_err());
+    assert!(!client.has_record(&owner));
+}
 
 // ---------------------------------------------------------------------------
 // Uninitialized / permission failure paths
 // ---------------------------------------------------------------------------
 
 #[test]
-#[should_panic(expected = "not initialized")]
+#[should_panic(expected = "Error(Contract, #1)")]
 fn test_set_record_panics_before_init() {
     let e = Env::default();
     e.mock_all_auths();
@@ -406,7 +398,7 @@ fn test_set_record_panics_before_init() {
 }
 
 #[test]
-#[should_panic(expected = "not initialized")]
+#[should_panic(expected = "Error(Contract, #1)")]
 fn test_remove_record_panics_before_init() {
     let e = Env::default();
     e.mock_all_auths();
@@ -650,4 +642,127 @@ fn test_has_record_after_explicit_remove() {
     assert!(!client.has_record(&owner));
     assert!(!client.is_expired(&owner));
 }
-                               
+
+// ===========================================================================
+// Issue #1609 Acceptance Criteria Tests
+// ===========================================================================
+
+#[test]
+fn expired_get_record_has_no_side_effects() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (_, contract_id, client) = setup(&e);
+
+    let owner = Address::generate(&e);
+    client.set_record(&owner, &5, &100);
+    advance_time(&e, 100);
+
+    let res = client.try_get_record(&owner);
+    assert_eq!(
+        res,
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            ContractError::SignatureExpired as u32
+        )))
+    );
+
+    let still_in_storage = e.as_contract(&contract_id, || {
+        e.storage().instance().has(&DataKey::Record(owner.clone()))
+    });
+    assert!(still_in_storage);
+}
+
+#[test]
+fn purge_expired_removes_record() {
+    use soroban_sdk::testutils::Events as _;
+    use soroban_sdk::IntoVal;
+
+    let e = Env::default();
+    e.mock_all_auths();
+    let (_, contract_id, client) = setup(&e);
+
+    let owner = Address::generate(&e);
+    client.set_record(&owner, &5, &100);
+    advance_time(&e, 100);
+
+    client.purge_expired(&owner);
+    let events = e.events().all();
+    let expected_topics = (Symbol::new(&e, "record_purged"), owner.clone()).into_val(&e);
+    assert!(events
+        .iter()
+        .any(|(_, topics, _)| topics == expected_topics));
+
+    assert!(!client.has_record(&owner));
+
+    let in_storage = e.as_contract(&contract_id, || {
+        e.storage().instance().has(&DataKey::Record(owner.clone()))
+    });
+    assert!(!in_storage);
+}
+
+#[test]
+fn purge_unexpired_rejected() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (_, contract_id, client) = setup(&e);
+
+    let owner = Address::generate(&e);
+    client.set_record(&owner, &5, &100);
+    advance_time(&e, 99);
+
+    let res = client.try_purge_expired(&owner);
+    assert_eq!(
+        res,
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            ContractError::DelegationNotExpired as u32
+        )))
+    );
+
+    let still_in_storage = e.as_contract(&contract_id, || {
+        e.storage().instance().has(&DataKey::Record(owner.clone()))
+    });
+    assert!(still_in_storage);
+}
+
+#[test]
+fn set_record_rejects_past_expiry() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (_, _, client) = setup(&e);
+
+    let owner = Address::generate(&e);
+    advance_time(&e, 1000);
+
+    let err_past = client.try_set_record(&owner, &10, &999);
+    assert_eq!(
+        err_past,
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            ContractError::ExpiryInPast as u32
+        )))
+    );
+
+    let err_now = client.try_set_record(&owner, &10, &1000);
+    assert_eq!(
+        err_now,
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            ContractError::ExpiryInPast as u32
+        )))
+    );
+
+    client.set_record(&owner, &10, &0);
+    assert_eq!(client.get_record(&owner).value, 10);
+}
+
+#[test]
+fn uninitialized_calls_return_typed_error() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let contract_id = e.register(TemplateContract, ());
+    let client = TemplateContractClient::new(&e, &contract_id);
+
+    assert_eq!(
+        client.try_get_admin(),
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            ContractError::NotInitialized as u32
+        )))
+    );
+}

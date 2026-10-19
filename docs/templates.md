@@ -35,46 +35,52 @@ Canonical Soroban contract template for the Credence workspace. Copy this crate 
 
 ### `initialize(admin: Address)`
 
-Set the contract admin. Panics with `"already initialized"` if called more than once. Emits an `initialized` event.
+Set the contract admin. Requires `admin.require_auth()`. Panics with `ContractError::AlreadyInitialized` (`#2`) if called more than once. Emits an `initialized` event.
 
 ### `set_record(owner: Address, value: i128, expires_at: u64)`
 
-Store or overwrite a `Record` for `owner`. Requires admin authorization. Records the current ledger timestamp in `updated_at`. Emits a `record_set` event.
+Store or overwrite a `Record` for `owner`. Requires admin authorization (`ContractError::NotInitialized` if uninitialised). Rejects `expires_at != 0 && expires_at <= now` with `ContractError::ExpiryInPast` (`#500`). Records the current ledger timestamp in `updated_at`. Emits a `record_set` event.
 
 ### `remove_record(owner: Address)`
 
-Delete the record for `owner`. Requires admin authorization. No-op if the record does not exist. Emits a `record_removed` event.
+Delete the record for `owner`. Requires admin authorization (`ContractError::NotInitialized` if uninitialised). No-op if the record does not exist. Emits a `record_removed` event.
+
+### `purge_expired(owner: Address)`
+
+Explicitly remove an expired record for `owner`. Permissionless by design (removing already-expired state is harmless). Panics with `ContractError::AttestationNotFound` (`#301`) if no record exists or `ContractError::DelegationNotExpired` (`#509`) if the record has not yet expired. Emits a `record_purged` event.
 
 ### `get_record(owner: Address) -> Record`
 
-Return the record for `owner`. Panics with `"record not found"` if none exists, or with the `SignatureExpired` contract error (`Error(Contract, #222)`) if the current timestamp is >= `expires_at`. Expired records are auto-purged on read.
+Pure read-only view returning the record for `owner`. Panics with `ContractError::AttestationNotFound` (`#301`) if none exists, or `ContractError::SignatureExpired` (`#222`) if `e.ledger().timestamp() >= expires_at`. Does not mutate storage (since Soroban rolls back writes on any panicking invocation).
 
 ### `has_record(owner: Address) -> bool`
 
-Return `true` if an active record exists for `owner`, `false` otherwise. If the record is expired, it is auto-purged and returns `false`.
+Pure read-only view returning `true` if a non-expired record exists for `owner`, `false` otherwise.
 
 ### `is_expired(owner: Address) -> bool`
 
-Return `true` if a record exists for `owner` but is currently expired.
+Return `true` if a record exists for `owner` in storage and is currently expired.
 
-## How to add TTL/expiry
+## How to handle TTL/expiry
 
-This template implements an upgrade-safe, auto-purging expiry pattern:
-1. Store an `expires_at` (`u64`) timestamp alongside the data.
-2. Provide an `is_expired` read view for indexers and clients.
-3. In `get_` and `has_` methods, check `e.ledger().timestamp() >= expires_at`. If true, delete the data and return as if it was not found. This clears dead state passively without requiring cron jobs.
+Because Soroban rolls back all ledger writes whenever a contract invocation panics, a `get_record` function that calls `.remove(...)` followed by `panic_with_error!` never persists its deletion. Instead:
+1. Validate `expires_at == 0 || expires_at > now` at write time (`set_record`).
+2. Keep `get_record`, `has_record`, and `is_expired` strictly read-only.
+3. Provide an explicit, non-panicking `purge_expired(owner)` entry point that removes expired records and emits `record_purged`.
 
-### `get_admin() -> Address`
+### `get_admin() -> Address` / `set_admin(new_admin: Address)`
 
-Return the current admin address. Panics with `"not initialized"` if the contract has not been initialised.
+Exported once through `interfaces::governable::Governable`. Panics with `ContractError::NotInitialized` (`#1`) if the contract has not been initialised.
 
 ## Events
 
-| Event            | Topic key          | Data    | Emitted when                    |
-|------------------|--------------------|---------|---------------------------------|
-| `initialized`    | `initialized`      | admin   | Contract is initialised         |
-| `record_set`     | `record_set, owner`| value   | A record is created or updated  |
-| `record_removed` | `record_removed, owner` | `()` | A record is deleted            |
+| Event               | Topic key              | Data                | Emitted when                     |
+|---------------------|------------------------|---------------------|----------------------------------|
+| `initialized`       | `initialized`          | `admin`             | Contract is initialised          |
+| `record_set`        | `record_set, owner`    | `value`             | A record is created or updated   |
+| `record_removed`    | `record_removed, owner`| `()`                | A record is deleted by admin     |
+| `record_purged`     | `record_purged, owner` | `()`                | An expired record is purged      |
+| `admin_transferred` | `admin_transferred`    | `(old_admin, new)`  | Admin role is transferred        |
 
 ## Security
 

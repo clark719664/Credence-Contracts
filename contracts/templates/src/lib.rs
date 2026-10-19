@@ -32,6 +32,7 @@
 #![cfg_attr(not(test), deny(clippy::disallowed_macros))]
 
 use credence_errors::ContractError;
+use interfaces::governable::Governable;
 use soroban_sdk::{contract, contractimpl, contracttype, panic_with_error, Address, Env, Symbol};
 
 // ---------------------------------------------------------------------------
@@ -81,6 +82,7 @@ impl TemplateContract {
             &e,
             e.storage().instance().has(&DataKey::Admin),
         );
+        admin.require_auth();
         e.storage().instance().set(&DataKey::Admin, &admin);
         e.events().publish((Symbol::new(&e, "initialized"),), admin);
     }
@@ -95,12 +97,17 @@ impl TemplateContract {
             .storage()
             .instance()
             .get(&DataKey::Admin)
-            .expect("not initialized");
+            .unwrap_or_else(|| panic_with_error!(&e, ContractError::NotInitialized));
         admin.require_auth();
+
+        let now = e.ledger().timestamp();
+        if expires_at != 0 && expires_at <= now {
+            panic_with_error!(&e, ContractError::ExpiryInPast);
+        }
 
         let record = Record {
             value,
-            updated_at: e.ledger().timestamp(),
+            updated_at: now,
             expires_at,
         };
         e.storage()
@@ -117,7 +124,7 @@ impl TemplateContract {
             .storage()
             .instance()
             .get(&DataKey::Admin)
-            .expect("not initialized");
+            .unwrap_or_else(|| panic_with_error!(&e, ContractError::NotInitialized));
         admin.require_auth();
 
         e.storage()
@@ -128,45 +135,63 @@ impl TemplateContract {
             .publish((Symbol::new(&e, "record_removed"), owner), ());
     }
 
-    // -----------------------------------------------------------------------
-    // Read-only entry points
-    // -----------------------------------------------------------------------
-
-    /// Return the record for `owner`, or panic if none exists.
-    pub fn get_record(e: Env, owner: Address) -> Record {
+    /// Explicitly remove an expired record for `owner`.
+    ///
+    /// Permissionless by design: removing already-expired state is harmless and
+    /// allows any caller or keeper to reclaim storage without admin intervention.
+    pub fn purge_expired(e: Env, owner: Address) {
         let record: Record = e
             .storage()
             .instance()
             .get(&DataKey::Record(owner.clone()))
-            .expect("record not found");
+            .unwrap_or_else(|| panic_with_error!(&e, ContractError::AttestationNotFound));
 
-        // Reference expiry pattern: reject and purge on read if expired
+        if !credence_errors::is_expired(&e, record.expires_at) {
+            panic_with_error!(&e, ContractError::DelegationNotExpired);
+        }
+
+        e.storage()
+            .instance()
+            .remove(&DataKey::Record(owner.clone()));
+
+        e.events()
+            .publish((Symbol::new(&e, "record_purged"), owner), ());
+    }
+
+    // -----------------------------------------------------------------------
+    // Read-only entry points
+    // -----------------------------------------------------------------------
+
+    /// Return the record for `owner`, or panic with a typed error if missing or expired.
+    /// Pure read: never mutates storage.
+    pub fn get_record(e: Env, owner: Address) -> Record {
+        let record: Record = e
+            .storage()
+            .instance()
+            .get(&DataKey::Record(owner))
+            .unwrap_or_else(|| panic_with_error!(&e, ContractError::AttestationNotFound));
+
         if credence_errors::is_expired(&e, record.expires_at) {
-            e.storage().instance().remove(&DataKey::Record(owner));
             panic_with_error!(&e, ContractError::SignatureExpired);
         }
 
         record
     }
 
-    /// Return `true` if a record exists for `owner`.
+    /// Return `true` if a non-expired record exists for `owner`.
+    /// Pure read: never mutates storage.
     pub fn has_record(e: Env, owner: Address) -> bool {
         if let Some(record) = e
             .storage()
             .instance()
-            .get::<_, Record>(&DataKey::Record(owner.clone()))
+            .get::<_, Record>(&DataKey::Record(owner))
         {
-            if credence_errors::is_expired(&e, record.expires_at) {
-                e.storage().instance().remove(&DataKey::Record(owner));
-                return false;
-            }
-            return true;
+            return !credence_errors::is_expired(&e, record.expires_at);
         }
         false
     }
 
     /// Return `true` if a record exists for `owner` and is currently expired.
-    /// Demonstrates the reference expiry pattern.
     pub fn is_expired(e: Env, owner: Address) -> bool {
         if let Some(record) = e
             .storage()
@@ -178,16 +203,12 @@ impl TemplateContract {
         false
     }
 
-    /// Return the current admin address.
-    pub fn get_admin(e: Env) -> Address {
-        e.storage()
+    pub fn transfer_admin(e: Env, new_admin: Address) {
+        let current_admin: Address = e
+            .storage()
             .instance()
             .get(&DataKey::Admin)
-            .expect("not initialized")
-    }
-
-    pub fn transfer_admin(e: Env, new_admin: Address) {
-        let current_admin = Self::get_admin(e.clone());
+            .unwrap_or_else(|| panic_with_error!(&e, ContractError::NotInitialized));
         current_admin.require_auth();
         e.storage().instance().set(&DataKey::Admin, &new_admin);
         e.events().publish(
@@ -198,9 +219,12 @@ impl TemplateContract {
 }
 
 #[contractimpl]
-impl interfaces::governable::Governable for TemplateContract {
+impl Governable for TemplateContract {
     fn get_admin(e: Env) -> Address {
-        Self::get_admin(e)
+        e.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&e, ContractError::NotInitialized))
     }
 
     fn set_admin(e: Env, new_admin: Address) {
